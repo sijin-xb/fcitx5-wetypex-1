@@ -311,6 +311,7 @@ class WeType : public InputMethodEngine {
   FactoryFor<State> factory_;
   SimpleAction settingsAction_;
   Connection settingsConnection_;
+  Connection commitFilterConnection_;
   std::map<uint64_t, TrackableObjectReference<InputContext>> contexts_;
   pid_t child_ = -1;
   int read_ = -1, write_ = -1;
@@ -583,14 +584,15 @@ class WeType : public InputMethodEngine {
   }
   void deliverNumericText(InputContext *ic, State *s,
                           const std::string &text) {
-    const bool spaced =
-        *config_.appearance->autoSpace && s && !text.empty() && s->lastCommitTail;
-    std::string payload = text;
-    if (spaced && isNeedSpace(s->lastCommitTail, firstScalar(text)))
-      payload.insert(payload.begin(), ' ');
     if (!numericKeyTransport(ic)) {
-      ic->commitString(payload);
+      // Forwarded keys bypass Instance::CommitFilter, so only this branch
+      // needs to place the space itself; commitString is filtered upstream.
+      ic->commitString(text);
     } else {
+      std::string payload = text;
+      if (s && *config_.appearance->autoSpace && s->lastCommitTail &&
+          !text.empty() && isNeedSpace(s->lastCommitTail, firstScalar(text)))
+        payload.insert(payload.begin(), ' ');
       // Qt's D-Bus client can temporarily discard its surrounding-text cache
       // while still reporting the document. Keep this path on ordered keys.
       std::string_view remaining(payload);
@@ -601,9 +603,11 @@ class WeType : public InputMethodEngine {
         ic->forwardKey(key, true);
         remaining.remove_prefix(firstUtf8Size(remaining));
       }
+      if (s && !text.empty()) {
+        s->lastCommitTail = lastScalar(text);
+        s->lastCommitAt = now(CLOCK_MONOTONIC);
+      }
     }
-    if (s && !text.empty())
-      s->lastCommitTail = lastScalar(text);
   }
   void scheduleNumericCorrection() {
     if (!numericTimer_)
@@ -716,15 +720,17 @@ class WeType : public InputMethodEngine {
   bool isNeedSpace(char32_t prev, char32_t curr) const {
     const bool en = *config_.appearance->autoSpaceEnglish;
     const bool num = *config_.appearance->autoSpaceDigit;
+    // Chinese numerals sit in the core's alphabetSet so that 第5章 stays tight,
+    // but treating them as letters also spaces 统一 一 下. They are ordinary
+    // CJK text here, so no boundary is drawn around them.
+    if (isChineseNumeral(prev) || isChineseNumeral(curr))
+      return false;
     const int cp = charClass(prev);
     const int cc = charClass(curr);
     const bool cjkPrev = cp == 3;
     const bool cjkCurr = cc == 3;
     if (cjkPrev == cjkCurr)
       return false;
-    // Exactly one side is CJK. Pick the switch from the other side's class:
-    // a letter (or Chinese numeral) goes through English, an ASCII digit
-    // through Digit, and anything else stays tight.
     const int other = cjkPrev ? cc : cp;
     if (other == 1)
       return en;
@@ -817,20 +823,6 @@ class WeType : public InputMethodEngine {
     // Clients that never report surrounding text (terminals) leave us
     // guessing, so only trust the cached tail while typing is continuous.
     return fresh ? s->lastCommitTail : 0;
-  }
-  void commitAutoSpaced(InputContext *ic, State *s, const std::string &text) {
-    if (text.empty())
-      return;
-    if (*config_.appearance->autoSpace) {
-      char32_t prior = resolvePrior(ic, s);
-      // applyAutoSpace advances prior to the last character it emitted, which
-      // is what the next commit must compare against.
-      auto out = applyAutoSpace(text, &prior);
-      ic->commitString(out);
-      s->lastCommitTail = prior;
-      s->lastCommitAt = now(CLOCK_MONOTONIC);
-    } else
-      ic->commitString(text);
   }
   template <typename Context, typename Flag = CapabilityFlag>
   void commitStringAtCursor(Context *ic, const std::string &text,
@@ -2349,7 +2341,7 @@ class WeType : public InputMethodEngine {
       for (size_t i = 0; i < json_object_array_length(commits); i++) {
         auto *v = json_object_array_get_idx(commits, i);
         if (json_object_is_type(v, json_type_string))
-          commitAutoSpaced(ic, s, json_object_get_string(v));
+          ic->commitString(json_object_get_string(v));
       }
     auto cursorCommit = wire::str(j.get(), "cursor_commit");
     auto cursorCommitPosition =
@@ -2472,6 +2464,23 @@ public:
                                    &instance_->userInterfaceManager());
     settingsConnection_ = settingsAction_.connect<SimpleAction::Activated>(
         [](InputContext *) { startProcess({WETYPE_SETTINGS}); });
+    commitFilterConnection_ =
+        instance_->connect<Instance::CommitFilter>(
+            [this](InputContext *ic, std::string &orig) {
+              if (FILE *dbg = fopen("/tmp/wetypex-debug.log", "a")) {
+                fprintf(dbg, "COMMITFILTER [%s] len=%zu\n", orig.c_str(),
+                        orig.size());
+                fclose(dbg);
+              }
+              State *s = ic ? state(ic) : nullptr;
+              if (!s || !*config_.appearance->autoSpace || orig.empty())
+                return;
+              char32_t prior = resolvePrior(ic, s);
+              if (prior)
+                orig = applyAutoSpace(orig, &prior);
+              s->lastCommitTail = lastScalar(orig);
+              s->lastCommitAt = now(CLOCK_MONOTONIC);
+            });
     // Fcitx global triggers run before the engine. Own explicitly configured
     // shortcuts and bare language modifiers so their ordered commits survive.
     languageModifierWatcher_ = instance_->watchEvent(
@@ -2896,7 +2905,7 @@ public:
         ic->inputPanel().setCandidateList(nullptr);
       } else {
         if (!s->preedit.empty())
-          commitAutoSpaced(ic, s, s->preedit);
+          ic->commitString(s->preedit);
         ++s->epoch;
         s->selectionPending = false;
         s->deferredKeys.clear();
