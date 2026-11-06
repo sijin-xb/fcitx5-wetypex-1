@@ -648,8 +648,43 @@ class WeType : public InputMethodEngine {
       return entry->englishHalf;
     return entry->normal;
   }
-  // CJK blocks, following pangu.js: radicals, kana, bopomofo and the enclosed
-  // forms count too, not just Han ideographs.
+  // Ported from WeType's SmartSpace class. CharB0 assigns every character to
+  // one of four classes; SmartSpace.isNeedSpace then decides from the pair.
+  //   Class 1: Chinese numerals and ASCII letters
+  //   Class 2: ASCII digits and the special symbol set
+  //   Class 3: CJK
+  //   Class 0: everything else
+  static int charClass(char32_t c) {
+    if (isChineseNumeral(c) || (c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z'))
+      return 1;
+    if ((c >= '0' && c <= '9') || isSpecialSymbol(c))
+      return 2;
+    if (isCjk(c))
+      return 3;
+    return 0;
+  }
+  static bool isChineseNumeral(char32_t c) {
+    switch (c) {
+    case U'零': case U'一': case U'二': case U'三': case U'四':
+    case U'五': case U'六': case U'七': case U'八': case U'九':
+    case U'十': case U'百': case U'千': case U'万': case U'亿':
+      return true;
+    default:
+      return false;
+    }
+  }
+  static bool isSpecialSymbol(char32_t c) {
+    switch (c) {
+    case U'.': case U',': case U':': case U';': case U'!':
+    case U'?': case U'%': case U'$': case U'@': case U'#':
+    case U'&': case U'*': case U'-': case U'+': case U'=':
+    case U'/': case U'\\': case U'|': case U'~': case U'^':
+      return true;
+    default:
+      return false;
+    }
+  }
   static bool isCjk(char32_t c) {
     return (c >= 0x2E80 && c <= 0x2EFF) ||  // CJK radicals supplement
            (c >= 0x2F00 && c <= 0x2FDF) ||  // Kangxi radicals
@@ -663,7 +698,42 @@ class WeType : public InputMethodEngine {
            (c >= 0xF900 && c <= 0xFAFF) ||  // Compatibility ideographs
            (c >= 0x20000 && c <= 0x2FA1F);  // Extensions B onwards
   }
-  static bool isDigit(char32_t c) { return c >= '0' && c <= '9'; }
+  static bool isSpaceChar(char32_t c) {
+    return c == ' ' || c == 0x3000 || c == 0x00A0;
+  }
+  // SmartSpace.isNeedSpace(prev, curr)
+  bool isNeedSpace(char32_t prev, char32_t curr) const {
+    const int cp = charClass(prev);
+    const int cc = charClass(curr);
+    switch (cp) {
+    case 0:
+      return *config_.appearance->autoSpaceDigit;
+    case 1:
+      return cc == 3;
+    case 2:
+      return cc != 1 && cc != 2;
+    default:
+      return false;
+    }
+  }
+  std::string applyAutoSpace(const std::string &text, char32_t *tail) const {
+    if (text.empty())
+      return text;
+    std::string out;
+    out.reserve(text.size() + 8);
+    size_t i = 0, width = 0;
+    char32_t prev = *tail;
+    while (i < text.size()) {
+      const auto c = decodeOne(text, i, &width);
+      if (prev && !isSpaceChar(c) && !isSpaceChar(prev) && isNeedSpace(prev, c))
+        out += ' ';
+      out.append(text, i, width);
+      prev = c;
+      i += width;
+    }
+    *tail = prev;
+    return out;
+  }
   static char32_t decodeOne(const std::string &text, size_t at,
                             size_t *width) {
     const auto *p = reinterpret_cast<const unsigned char *>(text.data()) + at;
@@ -690,39 +760,6 @@ class WeType : public InputMethodEngine {
     }
     *width = n;
     return c;
-  }
-  static bool isLetter(char32_t c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= 0x0370 && c <= 0x03FF) || (c >= 0x2100 && c <= 0x214F) ||
-           (c >= 0x00A1 && c <= 0x00FF);
-  }
-  static bool isSpaceChar(char32_t c) {
-    return c == ' ' || c == 0x3000 || c == 0x00A0;
-  }
-  std::string applyAutoSpace(const std::string &text, char32_t *tail) const {
-    if (text.empty())
-      return text;
-    const bool wantEnglish = *config_.appearance->autoSpaceEnglish;
-    const bool wantDigit = *config_.appearance->autoSpaceDigit;
-    std::string out;
-    out.reserve(text.size() + 8);
-    size_t i = 0, width = 0;
-    char32_t prev = *tail;
-    while (i < text.size()) {
-      const auto c = decodeOne(text, i, &width);
-      if (!isSpaceChar(c) && prev && !isSpaceChar(prev) &&
-          isCjk(prev) != isCjk(c)) {
-        const char32_t half = isCjk(prev) ? c : prev;
-        const bool wanted = isDigit(half) ? wantDigit : wantEnglish;
-        if (wanted && (isDigit(half) || isLetter(half)))
-          out += ' ';
-      }
-      out.append(text, i, width);
-      prev = c;
-      i += width;
-    }
-    *tail = prev;
-    return out;
   }
   static char32_t lastScalar(const std::string &text) {
     size_t at = text.size(), width = 0;
