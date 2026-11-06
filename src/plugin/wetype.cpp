@@ -663,34 +663,7 @@ class WeType : public InputMethodEngine {
            (c >= 0xF900 && c <= 0xFAFF) ||  // Compatibility ideographs
            (c >= 0x20000 && c <= 0x2FA1F);  // Extensions B onwards
   }
-  // Half-width side. pangu.js also treats Greek, number forms and letterlike
-  // symbols as ANS, which matters for things like 第②章 or α粒子.
-  static bool isAsciiWord(char32_t c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-           (c >= 'A' && c <= 'Z') || (c >= 0x0370 && c <= 0x03FF) ||
-           (c >= 0x2100 && c <= 0x214F) || (c >= 0x2150 && c <= 0x218F) ||
-           (c >= 0x2700 && c <= 0x27BF) || (c >= 0x00A1 && c <= 0x00FF);
-  }
   static bool isDigit(char32_t c) { return c >= '0' && c <= '9'; }
-  // 第3章 reads as one unit, so a digit after 第 takes no space.
-  static bool isOrdinalPrefix(char32_t c) { return c == U'第'; }
-  // Characters that bind to a preceding number: 100元, 5个, 3天.
-  static bool isMeasureWord(char32_t c) {
-    switch (c) {
-    case U'个': case U'元': case U'块': case U'角': case U'分':
-    case U'章': case U'节': case U'页': case U'行': case U'条':
-    case U'年': case U'月': case U'日': case U'号': case U'点':
-    case U'时': case U'刻': case U'秒': case U'天': case U'周':
-    case U'次': case U'位': case U'名': case U'项': case U'种':
-    case U'倍': case U'度': case U'层': case U'楼': case U'室':
-    case U'米': case U'克': case U'斤': case U'升': case U'寸':
-    case U'尺': case U'码': case U'亩': case U'岁': case U'级':
-    case U'版': case U'期': case U'届': case U'场': case U'轮':
-      return true;
-    default:
-      return false;
-    }
-  }
   static char32_t decodeOne(const std::string &text, size_t at,
                             size_t *width) {
     const auto *p = reinterpret_cast<const unsigned char *>(text.data()) + at;
@@ -718,28 +691,32 @@ class WeType : public InputMethodEngine {
     *width = n;
     return c;
   }
+  static bool isLetter(char32_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= 0x0370 && c <= 0x03FF) || (c >= 0x2100 && c <= 0x214F) ||
+           (c >= 0x00A1 && c <= 0x00FF);
+  }
+  static bool isSpaceChar(char32_t c) {
+    return c == ' ' || c == 0x3000 || c == 0x00A0;
+  }
   std::string applyAutoSpace(const std::string &text, char32_t *tail) const {
     if (text.empty())
       return text;
+    const bool wantEnglish = *config_.appearance->autoSpaceEnglish;
+    const bool wantDigit = *config_.appearance->autoSpaceDigit;
     std::string out;
     out.reserve(text.size() + 8);
     size_t i = 0, width = 0;
     char32_t prev = *tail;
     while (i < text.size()) {
       const auto c = decodeOne(text, i, &width);
-      if (c == ' ') {
-        prev = c;
-        out.append(text, i, width);
-        i += width;
-        continue;
+      if (!isSpaceChar(c) && prev && !isSpaceChar(prev) &&
+          isCjk(prev) != isCjk(c)) {
+        const char32_t half = isCjk(prev) ? c : prev;
+        const bool wanted = isDigit(half) ? wantDigit : wantEnglish;
+        if (wanted && (isDigit(half) || isLetter(half)))
+          out += ' ';
       }
-      const bool need =
-          (prev && isCjk(prev) && isAsciiWord(c) &&
-           !(isDigit(c) && isOrdinalPrefix(prev))) ||
-          (prev && isAsciiWord(prev) && isCjk(c) &&
-           !(isDigit(prev) && isMeasureWord(c)));
-      if (need)
-        out += ' ';
       out.append(text, i, width);
       prev = c;
       i += width;
@@ -763,19 +740,26 @@ class WeType : public InputMethodEngine {
     return at ? decodeOne(text, at - 1, &width) : 0;
   }
   char32_t resolvePrior(InputContext *ic, State *s) const {
+    const auto time = now(CLOCK_MONOTONIC);
+    const bool fresh = time - s->lastCommitAt < 60000000;
     const auto &surrounding = ic->surroundingText();
     if (surrounding.isValid()) {
-      // Whatever the client actually shows before the caret wins over our
-      // cached tail, which survives focus changes the client never reports.
       const auto &all = surrounding.text();
       const auto bytes =
           size_t(utf8::ncharByteLength(all.begin(), surrounding.cursor()));
-      return lastScalar(all.substr(0, std::min(bytes, all.size())));
+      const auto fromClient =
+          lastScalar(all.substr(0, std::min(bytes, all.size())));
+      // English-mode characters go straight to the client, and some clients
+      // report surrounding text a commit behind. Trust the cache only when the
+      // client shows nothing before the caret at all, which is the case that
+      // used to prepend a space into an empty field.
+      if (!fromClient && fresh)
+        return s->lastCommitTail;
+      return fromClient;
     }
     // Clients that never report surrounding text (terminals) leave us
     // guessing, so only trust the cached tail while typing is continuous.
-    const auto time = now(CLOCK_MONOTONIC);
-    return time - s->lastCommitAt < 10000000 ? s->lastCommitTail : 0;
+    return fresh ? s->lastCommitTail : 0;
   }
   void commitAutoSpaced(InputContext *ic, State *s, const std::string &text) {
     if (text.empty())
@@ -992,6 +976,9 @@ class WeType : public InputMethodEngine {
         std::clamp(int(wire::number(j.get(), "candidate_size", 13)), 10, 18));
     appearance->vertical.setValue(vertical_);
     appearance->autoSpace.setValue(boolSetting("auto_space", true));
+    appearance->autoSpaceEnglish.setValue(
+        boolSetting("auto_space_english", true));
+    appearance->autoSpaceDigit.setValue(boolSetting("auto_space_digit", true));
     appearance->languageHint.setValue(boolSetting("language_hint", true));
     appearance->preeditPosition.setValue(
         wire::str(j.get(), "preedit_position") == "candidate"
@@ -1142,6 +1129,9 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "candidate_size", int64_t(*appearance.candidateSize));
     wire::put(json.get(), "vertical", bool(*appearance.vertical));
     wire::put(json.get(), "auto_space", bool(*appearance.autoSpace));
+    wire::put(json.get(), "auto_space_english",
+              bool(*appearance.autoSpaceEnglish));
+    wire::put(json.get(), "auto_space_digit", bool(*appearance.autoSpaceDigit));
     wire::put(json.get(), "language_hint", bool(*appearance.languageHint));
     wire::put(json.get(), "preedit_position",
               std::string(*appearance.preeditPosition ==
@@ -2882,17 +2872,22 @@ public:
       sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
-    // Any key that is not a bare printable character can move the caret or
-    // edit text, so the cached tail no longer describes what precedes it.
-    // This is the only signal available on clients without surrounding text.
-    // A chord such as Ctrl+A still reports the printable keysym 'a', so the
-    // modifier state has to be part of the test.
+    // Keys that move the caret or rewrite text invalidate the cached tail.
+    // BackSpace is deliberately excluded: language switching and preedit
+    // handling send it internally, and clearing there loses the boundary the
+    // user just typed.
     if (!e.isRelease() && !key.isModifier()) {
-      const auto scalar = Key::keySymToUnicode(sym);
       const auto chords = key.states().toInteger() &
                           uint32_t(KeyState::SimpleMask) &
                           ~uint32_t(KeyState::Shift);
-      if (!(scalar >= 0x20 && scalar != 0x7f) || chords)
+      const bool movesCaret =
+          sym == FcitxKey_Left || sym == FcitxKey_Right ||
+          sym == FcitxKey_Up || sym == FcitxKey_Down ||
+          sym == FcitxKey_Home || sym == FcitxKey_End ||
+          sym == FcitxKey_Page_Up || sym == FcitxKey_Page_Down ||
+          sym == FcitxKey_Return || sym == FcitxKey_KP_Enter ||
+          sym == FcitxKey_Delete || sym == FcitxKey_Tab;
+      if (movesCaret || chords)
         s->lastCommitTail = 0;
     }
     if (!replayingKeys_) {
