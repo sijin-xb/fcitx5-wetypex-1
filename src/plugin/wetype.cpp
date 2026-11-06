@@ -738,13 +738,48 @@ class WeType : public InputMethodEngine {
       return num;
     return false;
   }
-  std::string applyAutoSpace(const std::string &text, char32_t *tail) const {
+  // Everything an incremental spacing rule is allowed to look at: the text
+  // already before the caret, most recent last. Rules that need more than a
+  // neighbour read backwards through this window. surroundingText() is the
+  // only trustworthy client view, so when it is invalid the window is just the
+  // cached tail, which is all a terminal ever gives us.
+  std::string beforeWindow(InputContext *ic, State *s) const {
+    constexpr size_t MaxChars = 32;
+    const auto &surrounding = ic->surroundingText();
+    if (surrounding.isValid()) {
+      const auto &all = surrounding.text();
+      const auto bytes =
+          size_t(utf8::ncharByteLength(all.begin(), surrounding.cursor()));
+      const auto end = std::min(bytes, all.size());
+      std::string window = all.substr(0, end);
+      if (utf8::length(window) > MaxChars) {
+        size_t at = window.size();
+        size_t chars = 0;
+        while (at > 0 && chars < MaxChars) {
+          --at;
+          while (at > 0 &&
+                 (static_cast<unsigned char>(window[at]) & 0xC0) == 0x80)
+            --at;
+          ++chars;
+        }
+        window.erase(0, at);
+      }
+      if (!window.empty())
+        return window;
+    }
+    const auto time = now(CLOCK_MONOTONIC);
+    if (time - s->lastCommitAt < 60000000 && s->lastCommitTail)
+      return utf8::UCS4ToUTF8(s->lastCommitTail);
+    return {};
+  }
+  std::string applyAutoSpace(const std::string &text,
+                             const std::string &before) const {
     if (text.empty())
       return text;
     std::string out;
     out.reserve(text.size() + 8);
     size_t i = 0, width = 0;
-    char32_t prev = *tail;
+    char32_t prev = lastScalar(before);
     while (i < text.size()) {
       const auto c = decodeOne(text, i, &width);
       if (prev && !isSpaceChar(c) && !isSpaceChar(prev) && isNeedSpace(prev, c))
@@ -753,7 +788,6 @@ class WeType : public InputMethodEngine {
       prev = c;
       i += width;
     }
-    *tail = prev;
     return out;
   }
   static char32_t decodeOne(const std::string &text, size_t at,
@@ -801,28 +835,6 @@ class WeType : public InputMethodEngine {
     while (at && (static_cast<unsigned char>(text[at - 1]) & 0xC0) == 0x80)
       --at;
     return at ? decodeOne(text, at - 1, &width) : 0;
-  }
-  char32_t resolvePrior(InputContext *ic, State *s) const {
-    const auto time = now(CLOCK_MONOTONIC);
-    const bool fresh = time - s->lastCommitAt < 60000000;
-    const auto &surrounding = ic->surroundingText();
-    if (surrounding.isValid()) {
-      const auto &all = surrounding.text();
-      const auto bytes =
-          size_t(utf8::ncharByteLength(all.begin(), surrounding.cursor()));
-      const auto fromClient =
-          lastScalar(all.substr(0, std::min(bytes, all.size())));
-      // English-mode characters go straight to the client, and some clients
-      // report surrounding text a commit behind. Trust the cache only when the
-      // client shows nothing before the caret at all, which is the case that
-      // used to prepend a space into an empty field.
-      if (!fromClient && fresh)
-        return s->lastCommitTail;
-      return fromClient;
-    }
-    // Clients that never report surrounding text (terminals) leave us
-    // guessing, so only trust the cached tail while typing is continuous.
-    return fresh ? s->lastCommitTail : 0;
   }
   template <typename Context, typename Flag = CapabilityFlag>
   void commitStringAtCursor(Context *ic, const std::string &text,
@@ -2467,17 +2479,10 @@ public:
     commitFilterConnection_ =
         instance_->connect<Instance::CommitFilter>(
             [this](InputContext *ic, std::string &orig) {
-              if (FILE *dbg = fopen("/tmp/wetypex-debug.log", "a")) {
-                fprintf(dbg, "COMMITFILTER [%s] len=%zu\n", orig.c_str(),
-                        orig.size());
-                fclose(dbg);
-              }
               State *s = ic ? state(ic) : nullptr;
               if (!s || !*config_.appearance->autoSpace || orig.empty())
                 return;
-              char32_t prior = resolvePrior(ic, s);
-              if (prior)
-                orig = applyAutoSpace(orig, &prior);
+              orig = applyAutoSpace(orig, beforeWindow(ic, s));
               s->lastCommitTail = lastScalar(orig);
               s->lastCommitAt = now(CLOCK_MONOTONIC);
             });
@@ -3228,11 +3233,9 @@ public:
           // commitAutoSpaced. Track it here, or a following Chinese candidate
           // would not see the ASCII word before the caret.
           if (!e.isRelease()) {
-            if (!entry && *config_.appearance->autoSpace) {
-              char32_t prior = resolvePrior(ic, s);
-              if (prior && isCjk(prior))
-                ic->commitString(" ");
-            }
+            if (!entry && *config_.appearance->autoSpace &&
+                isCjk(lastScalar(beforeWindow(ic, s))))
+              ic->commitString(" ");
             // A pass-through space is committed text too: leaving the previous
             // letter cached would make the next candidate add a second space.
             s->lastCommitTail = char32_t(sym);

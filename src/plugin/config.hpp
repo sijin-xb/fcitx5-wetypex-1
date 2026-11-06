@@ -121,11 +121,11 @@ FCITX_CONFIGURATION(
     Option<int, IntConstrain> pageSize{this, "PageSize", "每页候选数", 5,
                                        IntConstrain(3, 9)};
     Option<bool> vertical{this, "Vertical", "候选词竖排", false};
-    Option<bool> autoSpace{this, "AutoSpace", "中英文之间自动加空格", true};
-    Option<bool> autoSpaceEnglish{this, "AutoSpaceEnglish", "中文与英文之间加空格",
-                                  true};
-    Option<bool> autoSpaceDigit{this, "AutoSpaceDigit", "中文与数字之间加空格",
+    Option<bool> autoSpace{this, "AutoSpace", "辅助输入", true};
+    Option<bool> autoSpaceDigit{this, "AutoSpaceDigit", "中文和数字间加空格",
                                 true};
+    Option<bool> autoSpaceEnglish{this, "AutoSpaceEnglish", "中文和英文间加空格",
+                                  true};
     Option<bool> languageHint{this, "LanguageHint", "切换中英文时显示提示", true};
     Option<PreeditPosition> preeditPosition{
         this, "PreeditPosition", "拼音显示位置", PreeditPosition::Client};
