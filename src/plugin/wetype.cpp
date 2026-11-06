@@ -747,25 +747,26 @@ class WeType : public InputMethodEngine {
       --at;
     return at ? decodeOne(text, at - 1, &width) : 0;
   }
+  char32_t resolvePrior(InputContext *ic, State *s) const {
+    const auto &surrounding = ic->surroundingText();
+    if (surrounding.isValid()) {
+      // Whatever the client actually shows before the caret wins over our
+      // cached tail, which survives focus changes the client never reports.
+      const auto &all = surrounding.text();
+      const auto bytes =
+          size_t(utf8::ncharByteLength(all.begin(), surrounding.cursor()));
+      return lastScalar(all.substr(0, std::min(bytes, all.size())));
+    }
+    // Clients that never report surrounding text (terminals) leave us
+    // guessing, so only trust the cached tail while typing is continuous.
+    const auto time = now(CLOCK_MONOTONIC);
+    return time - s->lastCommitAt < 10000000 ? s->lastCommitTail : 0;
+  }
   void commitAutoSpaced(InputContext *ic, State *s, const std::string &text) {
     if (text.empty())
       return;
     if (*config_.appearance->autoSpace) {
-      char32_t prior = 0;
-      const auto &surrounding = ic->surroundingText();
-      if (surrounding.isValid()) {
-        // Whatever the client actually shows before the caret wins over our
-        // cached tail, which survives focus changes the client never reports.
-        const auto &all = surrounding.text();
-        const auto bytes = size_t(utf8::ncharByteLength(
-            all.begin(), surrounding.cursor()));
-        prior = lastScalar(all.substr(0, std::min(bytes, all.size())));
-      } else {
-        // Clients that never report surrounding text (terminals) leave us
-        // guessing, so only trust the cached tail while typing is continuous.
-        const auto time = now(CLOCK_MONOTONIC);
-        prior = time - s->lastCommitAt < 10000000 ? s->lastCommitTail : 0;
-      }
+      char32_t prior = resolvePrior(ic, s);
       // applyAutoSpace advances prior to the last character it emitted, which
       // is what the next commit must compare against.
       auto out = applyAutoSpace(text, &prior);
@@ -2833,7 +2834,7 @@ public:
         ic->inputPanel().setCandidateList(nullptr);
       } else {
         if (!s->preedit.empty())
-          ic->commitString(s->preedit);
+          commitAutoSpaced(ic, s, s->preedit);
         ++s->epoch;
         s->selectionPending = false;
         s->deferredKeys.clear();
@@ -2866,12 +2867,14 @@ public:
       sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
-    // Return starts a new line or submits the field, so the previous commit no
-    // longer sits before the caret. Terminals never report surrounding text,
-    // and this is the only signal we get there.
-    if (!e.isRelease() &&
-        (sym == FcitxKey_Return || sym == FcitxKey_KP_Enter))
-      s->lastCommitTail = 0;
+    // Any key that is not a printable character can move the caret or edit
+    // text, so the cached tail no longer describes what precedes it. This is
+    // the only signal available on clients without surrounding text.
+    if (!e.isRelease() && !key.isModifier()) {
+      const auto scalar = Key::keySymToUnicode(sym);
+      if (!(scalar >= 0x20 && scalar != 0x7f))
+        s->lastCommitTail = 0;
+    }
     if (!replayingKeys_) {
       s->physicalModifiers = e.rawKey().states().toInteger() &
                              uint32_t(KeyState::SimpleMask);
@@ -3139,6 +3142,19 @@ public:
           uint32_t full = sym == FcitxKey_space ? 0x3000 : sym + 0xfee0;
           ic->commitString(utf8::UCS4ToUTF8(full));
           e.filterAndAccept();
+        } else {
+          // The client inserts this character itself, so nothing reaches
+          // commitAutoSpaced. Track it here, or a following Chinese candidate
+          // would not see the ASCII word before the caret.
+          if (!e.isRelease() && !entry) {
+            if (*config_.appearance->autoSpace) {
+              char32_t prior = resolvePrior(ic, s);
+              if (prior && isCjk(prior))
+                ic->commitString(" ");
+            }
+            s->lastCommitTail = char32_t(sym);
+            s->lastCommitAt = now(CLOCK_MONOTONIC);
+          }
         }
       }
       return;
