@@ -581,21 +581,29 @@ class WeType : public InputMethodEngine {
   static bool numericKeyTransport(InputContext *ic) {
     return std::string_view(ic->frontend()) == "dbus";
   }
-  static void deliverNumericText(InputContext *ic, const std::string &text) {
+  void deliverNumericText(InputContext *ic, State *s,
+                          const std::string &text) {
+    const bool spaced =
+        *config_.appearance->autoSpace && s && !text.empty() && s->lastCommitTail;
+    std::string payload = text;
+    if (spaced && isNeedSpace(s->lastCommitTail, firstScalar(text)))
+      payload.insert(payload.begin(), ' ');
     if (!numericKeyTransport(ic)) {
-      ic->commitString(text);
-      return;
+      ic->commitString(payload);
+    } else {
+      // Qt's D-Bus client can temporarily discard its surrounding-text cache
+      // while still reporting the document. Keep this path on ordered keys.
+      std::string_view remaining(payload);
+      while (!remaining.empty()) {
+        const auto scalar = utf8::getChar(remaining.begin(), remaining.end());
+        const Key key(Key::keySymFromUnicode(scalar));
+        ic->forwardKey(key);
+        ic->forwardKey(key, true);
+        remaining.remove_prefix(firstUtf8Size(remaining));
+      }
     }
-    // Qt's D-Bus client can temporarily discard its surrounding-text cache
-    // while still reporting the document. Keep this path on ordered keys.
-    std::string_view remaining(text);
-    while (!remaining.empty()) {
-      const auto scalar = utf8::getChar(remaining.begin(), remaining.end());
-      const Key key(Key::keySymFromUnicode(scalar));
-      ic->forwardKey(key);
-      ic->forwardKey(key, true);
-      remaining.remove_prefix(firstUtf8Size(remaining));
-    }
+    if (s && !text.empty())
+      s->lastCommitTail = lastScalar(text);
   }
   void scheduleNumericCorrection() {
     if (!numericTimer_)
@@ -632,7 +640,7 @@ class WeType : public InputMethodEngine {
     } else {
       ic->deleteSurroundingText(-length, length);
     }
-    deliverNumericText(ic, replacement);
+    deliverNumericText(ic, state(ic), replacement);
   }
   std::string mappedSymbol(State *s, char ascii, bool asciiMode) const {
     const auto *entry = punctuationEntry(ascii);
@@ -701,20 +709,28 @@ class WeType : public InputMethodEngine {
   static bool isSpaceChar(char32_t c) {
     return c == ' ' || c == 0x3000 || c == 0x00A0;
   }
-  // SmartSpace.isNeedSpace(prev, curr)
+  // SmartSpace.isNeedSpace(prev, curr), with the CJK side made symmetric.
+  // The macOS core only spaces before CJK, so 你好Linux stays tight; users
+  // expect 你好 Linux, and committing the leading space up front gives that
+  // without rewriting text already on screen.
   bool isNeedSpace(char32_t prev, char32_t curr) const {
+    const bool en = *config_.appearance->autoSpaceEnglish;
+    const bool num = *config_.appearance->autoSpaceDigit;
     const int cp = charClass(prev);
     const int cc = charClass(curr);
-    switch (cp) {
-    case 0:
-      return *config_.appearance->autoSpaceDigit;
-    case 1:
-      return cc == 3;
-    case 2:
-      return cc != 1 && cc != 2;
-    default:
+    const bool cjkPrev = cp == 3;
+    const bool cjkCurr = cc == 3;
+    if (cjkPrev == cjkCurr)
       return false;
-    }
+    // Exactly one side is CJK. Pick the switch from the other side's class:
+    // a letter (or Chinese numeral) goes through English, an ASCII digit
+    // through Digit, and anything else stays tight.
+    const int other = cjkPrev ? cc : cp;
+    if (other == 1)
+      return en;
+    if (other == 2)
+      return num;
+    return false;
   }
   std::string applyAutoSpace(const std::string &text, char32_t *tail) const {
     if (text.empty())
@@ -760,6 +776,10 @@ class WeType : public InputMethodEngine {
     }
     *width = n;
     return c;
+  }
+  static char32_t firstScalar(const std::string &text) {
+    size_t width = 0;
+    return text.empty() ? 0 : decodeOne(text, 0, &width);
   }
   static char32_t lastScalar(const std::string &text) {
     size_t at = text.size(), width = 0;
@@ -853,7 +873,7 @@ class WeType : public InputMethodEngine {
                          (s->symbolAutoState || !s->pendingNumericText.empty());
     auto emit = [&](const std::string &value) {
       if (numeric)
-        deliverNumericText(ic, value);
+        deliverNumericText(ic, s, value);
       else
         ic->commitString(value);
       // Keep the auto-space boundary state current: punctuation must not let
@@ -3511,7 +3531,7 @@ public:
         (s->symbolAutoState || !s->pendingNumericText.empty())) {
       appendNumericCorrection(s, " ");
       s->symbolAutoState = 0;
-      deliverNumericText(ic, " ");
+      deliverNumericText(ic, s, " ");
       e.filterAndAccept();
       return;
     }
@@ -3545,7 +3565,7 @@ public:
       s->symbolAutoState = 3;
       // Keep digits and punctuation on the same ordered text channel.
       // Raw key forwarding can otherwise overtake a Wayland commit.
-      deliverNumericText(ic, std::string(1, asciiChar));
+      deliverNumericText(ic, s, std::string(1, asciiChar));
       if (!s->pendingNumericText.empty())
         scheduleNumericCorrection();
       e.filterAndAccept();
