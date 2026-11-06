@@ -67,6 +67,13 @@ template <typename System>
 struct HasXkbMask<System, std::void_t<decltype(
     std::declval<const System &>().xkbStateMask(std::string{}))>>
     : std::true_type {};
+template <typename System, typename = void>
+struct HasCustomImInfo : std::false_type {};
+template <typename System>
+struct HasCustomImInfo<System, std::void_t<decltype(
+    std::declval<System &>().showCustomInputMethodInformation(
+        std::declval<InputContext *>(), std::declval<const std::string &>()))>>
+    : std::true_type {};
 struct PunctuationEntry {
   char ascii;
   const char *full;
@@ -2755,6 +2762,9 @@ public:
            key.checkKeyList(instance_->globalConfig().defaultNextCandidate());
   }
   void showLanguageHint(InputContext *ic, State *s) {
+    if constexpr (HasCustomImInfo<Instance>::value)
+      instance_->showCustomInputMethodInformation(ic,
+                                                  s->english ? "英" : "中");
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(1);
     list->setLayoutHint(CandidateLayoutHint::Vertical);
