@@ -970,7 +970,8 @@ class WeType : public InputMethodEngine {
             : wetype_config::VoicePunctuationMode::Smart);
     auto *shortcuts = config_.shortcuts.mutableValue();
     shortcuts->shiftSwitch.setValue(boolSetting("shift_switch", true));
-    shortcuts->ctrlSwitch.setValue(boolSetting("ctrl_switch", false));    shortcuts->aiAssistant.setValue(boolSetting("ai_assistant", true));
+    shortcuts->ctrlSwitch.setValue(boolSetting("ctrl_switch", false));
+    shortcuts->aiAssistant.setValue(boolSetting("ai_assistant", true));
     shortcuts->vMode.setValue(boolSetting("v_mode", true));
     shortcuts->halfFull.setValue(boolSetting("half_full_switch", false));
     shortcuts->punctuationSwitch.setValue(
