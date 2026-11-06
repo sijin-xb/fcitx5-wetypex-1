@@ -716,7 +716,7 @@ class WeType : public InputMethodEngine {
         continue;
       }
       const bool need =
-          (prev && isCjk(prev) && isAsciiWord(c)) ||
+          (prev && isCjk(prev) && isAsciiWord(c) && !isDigit(c)) ||
           (prev && isAsciiWord(prev) && isCjk(c) &&
            !(isDigit(prev) && isMeasureWord(c)));
       if (need)
@@ -728,6 +728,12 @@ class WeType : public InputMethodEngine {
     *tail = prev;
     return out;
   }
+  static char32_t lastScalar(const std::string &text) {
+    size_t at = text.size(), width = 0;
+    while (at && (static_cast<unsigned char>(text[at - 1]) & 0xC0) == 0x80)
+      --at;
+    return at ? decodeOne(text, at - 1, &width) : 0;
+  }
   void commitAutoSpaced(InputContext *ic, State *s, const std::string &text) {
     if (text.empty())
       return;
@@ -735,11 +741,7 @@ class WeType : public InputMethodEngine {
       ic->commitString(applyAutoSpace(text, &s->lastCommitTail));
     else
       ic->commitString(text);
-    size_t at = text.size(), width = 0;
-    while (at && (static_cast<unsigned char>(text[at - 1]) & 0xC0) == 0x80)
-      --at;
-    if (at)
-      s->lastCommitTail = decodeOne(text, at - 1, &width);
+    s->lastCommitTail = lastScalar(text);
   }
   template <typename Context, typename Flag = CapabilityFlag>
   void commitStringAtCursor(Context *ic, const std::string &text,
@@ -781,6 +783,10 @@ class WeType : public InputMethodEngine {
         deliverNumericText(ic, value);
       else
         ic->commitString(value);
+      // Keep the auto-space boundary state current: punctuation must not let
+      // a later candidate think the previous commit ended with 我.
+      if (!value.empty())
+        s->lastCommitTail = lastScalar(value);
     };
     std::string mapped = mappedSymbol(s, ascii, asciiMode);
     if (autoChangeActive && !entry->pairType)
