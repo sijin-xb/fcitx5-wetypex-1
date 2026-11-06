@@ -648,13 +648,28 @@ class WeType : public InputMethodEngine {
       return entry->englishHalf;
     return entry->normal;
   }
+  // CJK blocks, following pangu.js: radicals, kana, bopomofo and the enclosed
+  // forms count too, not just Han ideographs.
   static bool isCjk(char32_t c) {
-    return (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) ||
-           (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x20000 && c <= 0x2FA1F);
+    return (c >= 0x2E80 && c <= 0x2EFF) ||  // CJK radicals supplement
+           (c >= 0x2F00 && c <= 0x2FDF) ||  // Kangxi radicals
+           (c >= 0x3040 && c <= 0x309F) ||  // Hiragana
+           (c >= 0x30A0 && c <= 0x30FA) ||  // Katakana, minus the middle dot
+           (c >= 0x30FC && c <= 0x30FF) ||
+           (c >= 0x3100 && c <= 0x312F) ||  // Bopomofo
+           (c >= 0x3200 && c <= 0x32FF) ||  // Enclosed CJK letters/months
+           (c >= 0x3400 && c <= 0x4DBF) ||  // Extension A
+           (c >= 0x4E00 && c <= 0x9FFF) ||  // Unified ideographs
+           (c >= 0xF900 && c <= 0xFAFF) ||  // Compatibility ideographs
+           (c >= 0x20000 && c <= 0x2FA1F);  // Extensions B onwards
   }
+  // Half-width side. pangu.js also treats Greek, number forms and letterlike
+  // symbols as ANS, which matters for things like 第②章 or α粒子.
   static bool isAsciiWord(char32_t c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-           (c >= 'A' && c <= 'Z');
+           (c >= 'A' && c <= 'Z') || (c >= 0x0370 && c <= 0x03FF) ||
+           (c >= 0x2100 && c <= 0x214F) || (c >= 0x2150 && c <= 0x218F) ||
+           (c >= 0x2700 && c <= 0x27BF) || (c >= 0x00A1 && c <= 0x00FF);
   }
   static bool isDigit(char32_t c) { return c >= '0' && c <= '9'; }
   // 第3章 reads as one unit, so a digit after 第 takes no space.
@@ -2867,12 +2882,17 @@ public:
       sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
-    // Any key that is not a printable character can move the caret or edit
-    // text, so the cached tail no longer describes what precedes it. This is
-    // the only signal available on clients without surrounding text.
+    // Any key that is not a bare printable character can move the caret or
+    // edit text, so the cached tail no longer describes what precedes it.
+    // This is the only signal available on clients without surrounding text.
+    // A chord such as Ctrl+A still reports the printable keysym 'a', so the
+    // modifier state has to be part of the test.
     if (!e.isRelease() && !key.isModifier()) {
       const auto scalar = Key::keySymToUnicode(sym);
-      if (!(scalar >= 0x20 && scalar != 0x7f))
+      const auto chords = key.states().toInteger() &
+                          uint32_t(KeyState::SimpleMask) &
+                          ~uint32_t(KeyState::Shift);
+      if (!(scalar >= 0x20 && scalar != 0x7f) || chords)
         s->lastCommitTail = 0;
     }
     if (!replayingKeys_) {
@@ -3146,12 +3166,14 @@ public:
           // The client inserts this character itself, so nothing reaches
           // commitAutoSpaced. Track it here, or a following Chinese candidate
           // would not see the ASCII word before the caret.
-          if (!e.isRelease() && !entry) {
-            if (*config_.appearance->autoSpace) {
+          if (!e.isRelease()) {
+            if (!entry && *config_.appearance->autoSpace) {
               char32_t prior = resolvePrior(ic, s);
               if (prior && isCjk(prior))
                 ic->commitString(" ");
             }
+            // A pass-through space is committed text too: leaving the previous
+            // letter cached would make the next candidate add a second space.
             s->lastCommitTail = char32_t(sym);
             s->lastCommitAt = now(CLOCK_MONOTONIC);
           }
