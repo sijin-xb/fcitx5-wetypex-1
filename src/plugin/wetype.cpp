@@ -263,6 +263,7 @@ struct State : InputContextProperty {
   bool active = false;
   Key modifierCandidate;
   char32_t lastCommitTail = 0;
+  uint64_t lastCommitAt = 0;
   uint64_t languageHintUntil = 0;
   TrackableObjectReference<InputContext> ic;
   State(uint64_t n, InputContext &context) : id(n), ic(context.watch()) {}
@@ -656,7 +657,9 @@ class WeType : public InputMethodEngine {
            (c >= 'A' && c <= 'Z');
   }
   static bool isDigit(char32_t c) { return c >= '0' && c <= '9'; }
-  // Characters that bind to a preceding number: 100元, 第3章, 5个.
+  // 第3章 reads as one unit, so a digit after 第 takes no space.
+  static bool isOrdinalPrefix(char32_t c) { return c == U'第'; }
+  // Characters that bind to a preceding number: 100元, 5个, 3天.
   static bool isMeasureWord(char32_t c) {
     switch (c) {
     case U'个': case U'元': case U'块': case U'角': case U'分':
@@ -716,7 +719,8 @@ class WeType : public InputMethodEngine {
         continue;
       }
       const bool need =
-          (prev && isCjk(prev) && isAsciiWord(c) && !isDigit(c)) ||
+          (prev && isCjk(prev) && isAsciiWord(c) &&
+           !(isDigit(c) && isOrdinalPrefix(prev))) ||
           (prev && isAsciiWord(prev) && isCjk(c) &&
            !(isDigit(prev) && isMeasureWord(c)));
       if (need)
@@ -734,14 +738,42 @@ class WeType : public InputMethodEngine {
       --at;
     return at ? decodeOne(text, at - 1, &width) : 0;
   }
+  static char32_t lastScalarBefore(const std::string &text, size_t chars) {
+    size_t bytes = utf8::ncharByteLength(text.begin(), chars);
+    if (bytes > text.size())
+      bytes = text.size();
+    size_t at = bytes, width = 0;
+    while (at && (static_cast<unsigned char>(text[at - 1]) & 0xC0) == 0x80)
+      --at;
+    return at ? decodeOne(text, at - 1, &width) : 0;
+  }
   void commitAutoSpaced(InputContext *ic, State *s, const std::string &text) {
     if (text.empty())
       return;
-    if (*config_.appearance->autoSpace)
-      ic->commitString(applyAutoSpace(text, &s->lastCommitTail));
-    else
+    if (*config_.appearance->autoSpace) {
+      char32_t prior = 0;
+      const auto &surrounding = ic->surroundingText();
+      if (surrounding.isValid()) {
+        // Whatever the client actually shows before the caret wins over our
+        // cached tail, which survives focus changes the client never reports.
+        const auto &all = surrounding.text();
+        const auto bytes = size_t(utf8::ncharByteLength(
+            all.begin(), surrounding.cursor()));
+        prior = lastScalar(all.substr(0, std::min(bytes, all.size())));
+      } else {
+        // Clients that never report surrounding text (terminals) leave us
+        // guessing, so only trust the cached tail while typing is continuous.
+        const auto time = now(CLOCK_MONOTONIC);
+        prior = time - s->lastCommitAt < 10000000 ? s->lastCommitTail : 0;
+      }
+      // applyAutoSpace advances prior to the last character it emitted, which
+      // is what the next commit must compare against.
+      auto out = applyAutoSpace(text, &prior);
+      ic->commitString(out);
+      s->lastCommitTail = prior;
+      s->lastCommitAt = now(CLOCK_MONOTONIC);
+    } else
       ic->commitString(text);
-    s->lastCommitTail = lastScalar(text);
   }
   template <typename Context, typename Flag = CapabilityFlag>
   void commitStringAtCursor(Context *ic, const std::string &text,
@@ -751,6 +783,9 @@ class WeType : public InputMethodEngine {
     if constexpr (HasCursorCommit<Context, Flag>::value) {
       if (ic->capabilityFlags().test(Flag::CommitStringWithCursor)) {
         ic->commitStringWithCursor(text, cursor);
+        // The caret now sits inside the pair, so the character before it, not
+        // the pair's last character, is what the next commit follows.
+        state(ic)->lastCommitTail = lastScalarBefore(text, cursor);
         return;
       }
     }
@@ -760,6 +795,7 @@ class WeType : public InputMethodEngine {
     // original desktop behavior with ordinary cursor movement.
     ic->commitString(text);
     forwardCursor(ic, state(ic), -int(length - cursor), text);
+    state(ic)->lastCommitTail = lastScalarBefore(text, cursor);
   }
   bool commitSymbol(InputContext *ic, State *s, char ascii, bool asciiMode) {
     const auto *entry = punctuationEntry(ascii);
@@ -2659,6 +2695,9 @@ public:
     s->vMode = false;
     s->vCalculator = false;
     s->cloudPollUntil = 0;
+    // The caret may have moved, so whatever was committed last no longer sits
+    // before the next character.
+    s->lastCommitTail = 0;
     ic->inputPanel().reset();
     if (child_ > 0)
       send(ic, "reset");
@@ -2827,6 +2866,12 @@ public:
       sym = KeySym(FcitxKey_0 + (sym - FcitxKey_KP_0));
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
+    // Return starts a new line or submits the field, so the previous commit no
+    // longer sits before the caret. Terminals never report surrounding text,
+    // and this is the only signal we get there.
+    if (!e.isRelease() &&
+        (sym == FcitxKey_Return || sym == FcitxKey_KP_Enter))
+      s->lastCommitTail = 0;
     if (!replayingKeys_) {
       s->physicalModifiers = e.rawKey().states().toInteger() &
                              uint32_t(KeyState::SimpleMask);
